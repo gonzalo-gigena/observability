@@ -32,6 +32,9 @@ services:
     build: ./apps/api
     environment:
       DATABASE_URL: *db-url
+      NATS_URL: nats://nats:4222
+      GOMEMLIMIT: 200MiB # below mem_limit, so the GC works harder before the kernel kills it
+      STREAM_MAX_BYTES: ${STREAM_MAX_BYTES:-1073741824}
     init: true
     stop_grace_period: 15s
     healthcheck:
@@ -49,6 +52,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      nats:
+        condition: service_healthy
     mem_limit: 256m
     restart: unless-stopped
 
@@ -62,6 +67,21 @@ services:
       - pgdata:/var/lib/postgresql  # 18+ keeps data in a versioned subdir
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    restart: unless-stopped
+
+  # Durable buffer between ingest and storage. Disk use is capped by the stream's
+  # max_bytes (STREAM_MAX_BYTES), which the api sets when it creates the stream.
+  nats:
+    image: nats:2.15.3-alpine
+    command: ["--jetstream", "--store_dir=/data", "--http_port=8222"]
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8222/healthz?js-enabled-only=true"]
       interval: 3s
       timeout: 3s
       retries: 10
@@ -100,4 +120,5 @@ services:
 
 volumes:
   pgdata:
+  natsdata:
   caddy_data:

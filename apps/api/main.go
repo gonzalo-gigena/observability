@@ -1,4 +1,5 @@
 // api: stateless HTTP service, and the ingest path (POST /v1/logs, /v1/metrics → JetStream).
+// `api writer` runs the JetStream → ClickHouse writer instead (writer.go).
 // `api healthcheck` lets the distroless image check itself.
 package main
 
@@ -35,6 +36,10 @@ type handler func(*http.Request) (int, any)
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(healthcheck())
+	}
+	run := run
+	if len(os.Args) > 1 && os.Args[1] == "writer" {
+		run = runWriter
 	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)

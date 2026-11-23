@@ -7,6 +7,7 @@ include:
     env_file: .env
   - path: common/fakes/mail/compose.yaml
     env_file: .env
+x-ch-password: &ch-password ${CLICKHOUSE_PASSWORD:?copy .env.example to .env}
 x-db-url: &db-url postgres://${POSTGRES_USER:?copy .env.example to .env}:${POSTGRES_PASSWORD:?copy .env.example to .env}@db:5432/${POSTGRES_DB:?copy .env.example to .env}?sslmode=disable
 
 services:
@@ -56,6 +57,65 @@ services:
         condition: service_healthy
     mem_limit: 256m
     restart: unless-stopped
+
+  # Scalable like the api: every replica shares the same JetStream pull consumers.
+  writer:
+    build: ./apps/api
+    command: ["writer"]
+    environment:
+      NATS_URL: nats://nats:4222
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: *ch-password
+      GOMEMLIMIT: 400MiB
+      WRITER_FAULT_NAK_EVERY: ${WRITER_FAULT_NAK_EVERY:-0} # tests only, see writer.go
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    develop:
+      watch:
+        - action: rebuild
+          path: ./apps/api
+    depends_on:
+      api: # creates the stream
+        condition: service_healthy
+      migrate-clickhouse:
+        condition: service_completed_successfully
+    mem_limit: 512m # a batch is capped at 32 MB of events
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8-alpine
+    environment:
+      CLICKHOUSE_PASSWORD: *ch-password # the default user has none otherwise
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 0
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./infra/clickhouse/config.d/limits.xml:/etc/clickhouse-server/config.d/limits.xml:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+    restart: unless-stopped
+
+  migrate-clickhouse:
+    image: migrate/migrate:v4.20.1
+    volumes:
+      - ./infra/clickhouse/migrations:/migrations:ro
+    command: ["-path=/migrations", "-database", "clickhouse://clickhouse:9000?username=default&password=${CLICKHOUSE_PASSWORD}&x-multi-statement=true&x-migrations-table-engine=MergeTree", "up"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
 
   db:
     image: postgres:18.6-alpine
@@ -121,4 +181,5 @@ services:
 volumes:
   pgdata:
   natsdata:
+  chdata:
   caddy_data:

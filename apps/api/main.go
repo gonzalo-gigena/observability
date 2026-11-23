@@ -1,4 +1,5 @@
-// api: stateless HTTP service. `api healthcheck` lets the distroless image check itself.
+// api: stateless HTTP service, and the ingest path (POST /v1/logs, /v1/metrics → JetStream).
+// `api healthcheck` lets the distroless image check itself.
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -70,6 +72,46 @@ func run() error {
 	}
 	defer pool.Close()
 
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		return errors.New("missing env var NATS_URL")
+	}
+	maxBytes, err := strconv.ParseInt(os.Getenv("STREAM_MAX_BYTES"), 10, 64)
+	if err != nil || maxBytes <= 0 {
+		return errors.New("STREAM_MAX_BYTES must be a positive integer")
+	}
+	nc, err := connectNATS(natsURL)
+	if err != nil {
+		return err
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc,
+		jetstream.WithPublishAsyncMaxPending(4*maxEvents),
+		jetstream.WithPublishAsyncTimeout(ackTimeout)) // frees pending slots when acks never arrive
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	// In the background, so a replica that starts while NATS is down still answers 503
+	// with Retry-After instead of refusing connections.
+	var streamReady atomic.Bool
+	go func() {
+		for ctx.Err() == nil {
+			err := ensureStream(ctx, js, maxBytes)
+			if err == nil {
+				streamReady.Store(true)
+				return
+			}
+			slog.Warn("creating stream, retrying", "err", err)
+			time.Sleep(time.Second)
+		}
+	}()
+	promauto.NewGaugeFunc(prometheus.GaugeOpts{Name: "ingest_stream_messages", Help: "JetStream backlog (queue depth)."}, func() float64 {
+		return streamDepth(js)
+	})
+	ing := &ingester{keys: &keyCache{pool: pool, m: map[[32]byte]cachedKey{}}, js: js}
+
 	var draining atomic.Bool
 	mux := http.NewServeMux()
 	route := func(pattern string, h handler) { mux.Handle(pattern, instrument(pattern, replica, h)) }
@@ -82,6 +124,9 @@ func run() error {
 		if err := pool.Ping(r.Context()); err != nil {
 			return 503, map[string]any{"ok": false, "reason": "db unreachable"}
 		}
+		if !streamReady.Load() || !nc.IsConnected() {
+			return 503, map[string]any{"ok": false, "reason": "nats unreachable"}
+		}
 		return 200, map[string]bool{"ok": true}
 	})
 	route("GET /api/hello", func(r *http.Request) (int, any) {
@@ -93,13 +138,12 @@ func run() error {
 		}
 		return 200, map[string]any{"message": msg, "replica": replica}
 	})
+	route("POST /v1/logs", ing.handle("logs"))
+	route("POST /v1/metrics", ing.handle("metrics"))
 	route("/", func(*http.Request) (int, any) { return 404, map[string]string{"error": "not found"} })
 	mux.Handle("GET /metrics", promhttp.Handler())
 
-	srv := &http.Server{Addr: ":" + port(), Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
-	defer stop()
-
+	srv := &http.Server{Addr: ":" + port(), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second}
 	errc := make(chan error, 1)
 	go func() {
 		slog.Info("listening on :" + port())
@@ -135,6 +179,9 @@ func instrument(pattern, replica string, h handler) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 
 		status, body := h(r)
+		if status == 503 {
+			w.Header().Set("Retry-After", "1")
+		}
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(body)
 

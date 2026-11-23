@@ -15,8 +15,12 @@ jobs:
       - run: cp .env.example .env
       - name: Unit tests
         run: docker run --rm -v "$PWD/apps/api:/src" -w /src golang:1.27.4-bookworm sh -c "go vet ./... && go test ./..."
+      - name: Migration lint
+        run: sh common/scripts/check-migrations.sh
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
+      - name: Storage (writer throughput, no duplicates on redelivery)
+        run: sh infra/test/storage.sh 500000 200000
 
   images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

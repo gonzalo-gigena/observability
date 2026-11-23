@@ -1,0 +1,6 @@
+<clickhouse>
+    <!-- Below the container's mem_limit (2g), so ClickHouse fails a query instead of being OOM-killed. -->
+    <max_server_memory_usage>1610612736</max_server_memory_usage>
+    <!-- Laptop-sized: the default system log tables add constant background inserts. -->
+    <logger><level>warning</level></logger>
+</clickhouse>

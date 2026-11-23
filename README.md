@@ -270,7 +270,7 @@ other Compose stacks busy on the machine:
 A 5,000-event batch takes about 160 ms, half of it the insert and half fetching and acking, done one
 after the other. Overlapping the fetch of the next batch with the current insert, or a second writer,
 is the next step if this becomes the bottleneck. Ingest measured 90k+ events/s above, so one writer is
-slower than one api; phase 7 measures writers at 1, 2 and 4 replicas. CI runs the same test with 500k + 200k.
+slower than one api; phase 7 measures writers at 1, 2 and 4 replicas. CI runs the same test with 500k + 200k. On an otherwise idle GitHub Actions runner, one writer sustained 145,773 events/s.
 
 The skeleton's baseline: k6 with 20 virtual users for 20 s against `GET /api/hello`, which reads one row from Postgres through Caddy. Run on an Apple M1 laptop with 8 CPUs and 8 GB given to Docker, with the dev override left out:
 
